@@ -36,6 +36,7 @@ from skimage.transform import resize as sk_resize
 import gudhi
 warnings.filterwarnings("ignore")
 
+# ── config ────────────────────────────────────────────────────────────────────
 CACHE_DIR     = "cache"
 OUT_DIR       = "."
 
@@ -447,12 +448,16 @@ results["Combined\nFix2+3"] = run_pipeline(
 ts("Finding representative ROIs …")
 
 def get_rep_rois(X, result):
-    pca_all  = PCA(n_components=N_PCA)
+    n_comp   = min(N_PCA_BASELINE, X.shape[1], X.shape[0]-1)
+    pca_all  = PCA(n_components=n_comp)
     Xpca_all = pca_all.fit_transform(X)
-    centroids = np.zeros((K_CLUSTERS, N_PCA))
+    # Use only the first n_comp dims of stored centroids too
+    rep_pca  = result["Xpca_rep"]
+    n_use    = min(n_comp, rep_pca.shape[1])
+    centroids = np.zeros((K_CLUSTERS, n_use))
     for c in range(1, K_CLUSTERS+1):
         mask = result["clusters_rep"] == c
-        centroids[c-1] = result["Xpca_rep"][mask].mean(axis=0)
+        centroids[c-1] = rep_pca[mask, :n_use].mean(axis=0)
     rois = {}
     for c in range(1, K_CLUSTERS+1):
         for g in [3,4,5]:
@@ -460,7 +465,7 @@ def get_rep_rois(X, result):
             if len(g_idx) == 0:
                 rois[(c,g)] = None
                 continue
-            dists = np.linalg.norm(Xpca_all[g_idx] - centroids[c-1], axis=1)
+            dists = np.linalg.norm(Xpca_all[g_idx, :n_use] - centroids[c-1], axis=1)
             best  = g_idx[np.argmin(dists)]
             rois[(c,g)] = all_imgs[best]
     return rois
