@@ -36,7 +36,6 @@ from skimage.transform import resize as sk_resize
 import gudhi
 warnings.filterwarnings("ignore")
 
-# ── config ────────────────────────────────────────────────────────────────────
 CACHE_DIR     = "cache"
 OUT_DIR       = "."
 
@@ -50,11 +49,13 @@ CACHE_MULTISCALE  = os.path.join(CACHE_DIR, "ph_multiscale.npz")
 CACHE_COMBINED    = os.path.join(CACHE_DIR, "ph_combined.npz")
 CACHE_BASELINE_V2 = os.path.join(CACHE_DIR, "ph_vectors.npz")  # already exists
 
-K_CLUSTERS   = 6
-N_BOOTSTRAP  = 50
-N_PCA        = 6
-DIRECTIONS   = [0, 45, 90, 135]   # degrees for PHT
-SCALES       = [32, 64, 128]       # pixels for multiscale
+K_CLUSTERS        = 6
+N_BOOTSTRAP       = 50
+N_PCA_BASELINE    = 6        # fixed 6 components for baseline (matches paper)
+PCA_VAR_THRESHOLD = 0.95     # Fix 1: novel variants retain components to explain 95% variance
+N_PCA_MAX         = 20       # cap so bootstrap (111 pts) isn't overfit
+DIRECTIONS        = [0, 45, 90, 135]   # degrees for PHT
+SCALES            = [32, 64, 128]       # pixels for multiscale
 
 FORCE = "--force" in sys.argv[1:]
 
@@ -74,6 +75,11 @@ def hema_from_thumb(thumb_f32):
 def normalise(arr):
     mn, mx = arr.min(), arr.max()
     return (arr - mn) / (mx - mn + 1e-9)
+
+def l2_normalise(vec):
+    """Fix 3: L2-normalise a vector so each view contributes equally."""
+    norm = np.linalg.norm(vec)
+    return vec / (norm + 1e-9)
 
 def ph_on_grid(grid_f64):
     """Run gudhi cubical PH on a 2D float64 array. Returns (dgm0, dgm1)."""
@@ -115,51 +121,44 @@ def directional_filtration(hema_norm, angle_deg, size=128):
 def extract_spatial(hema_128):
     """
     Intensity filtration + 4 directional filtrations at 128×128.
-    Returns concatenated ranked persistence vector.
+    Fix 3: each view L2-normalised before concatenation so no view dominates.
     """
     parts = []
-    # Intensity (superlevel → pass as-is for sublevel by using 1-hema)
     dgm0, dgm1 = ph_on_grid(hema_128)
-    parts.append(ranked_vec(dgm0, dgm1))
-    # Directional
+    parts.append(l2_normalise(ranked_vec(dgm0, dgm1)))
     for angle in DIRECTIONS:
         dgm0, dgm1 = directional_filtration(hema_128, angle, size=128)
-        parts.append(ranked_vec(dgm0, dgm1))
+        parts.append(l2_normalise(ranked_vec(dgm0, dgm1)))
     return np.concatenate(parts)
 
 def extract_multiscale(hema_128):
     """
     Intensity filtration at 3 scales (32, 64, 128).
-    Returns concatenated ranked persistence vector.
+    Fix 3: each scale L2-normalised before concatenation.
     """
     parts = []
     for size in SCALES:
-        if size == 128:
-            grid = hema_128
-        else:
-            grid = sk_resize(hema_128, (size, size), anti_aliasing=True)
+        grid = hema_128 if size == 128 else sk_resize(hema_128, (size, size), anti_aliasing=True)
         grid = normalise(grid).astype(np.float64)
         dgm0, dgm1 = ph_on_grid(grid)
-        parts.append(ranked_vec(dgm0, dgm1))
+        parts.append(l2_normalise(ranked_vec(dgm0, dgm1)))
     return np.concatenate(parts)
 
 def extract_combined(hema_128):
-    """All directions × all scales."""
+    """
+    All directions × all scales.
+    Fix 3: each (scale, direction) view L2-normalised before concatenation.
+    """
     parts = []
     for size in SCALES:
-        if size == 128:
-            grid = hema_128
-        else:
-            grid = normalise(
-                sk_resize(hema_128, (size, size), anti_aliasing=True)
-            ).astype(np.float64)
-        # Intensity
+        grid = hema_128 if size == 128 else normalise(
+            sk_resize(hema_128, (size, size), anti_aliasing=True)
+        ).astype(np.float64)
         dgm0, dgm1 = ph_on_grid(grid)
-        parts.append(ranked_vec(dgm0, dgm1))
-        # Directional
+        parts.append(l2_normalise(ranked_vec(dgm0, dgm1)))
         for angle in DIRECTIONS:
             dgm0, dgm1 = directional_filtration(grid, angle, size=size)
-            parts.append(ranked_vec(dgm0, dgm1))
+            parts.append(l2_normalise(ranked_vec(dgm0, dgm1)))
     return np.concatenate(parts)
 
 # ── load cached images ────────────────────────────────────────────────────────
@@ -264,13 +263,46 @@ def agglomerative_coeff(Z, n):
     ac = 1 - heights.mean() / max_h
     return float(ac)
 
-def run_pipeline(X, grades, label):
+def adaptive_pca(X, var_threshold=PCA_VAR_THRESHOLD, n_max=N_PCA_MAX):
+    """Fix 1: retain just enough components to explain var_threshold variance."""
+    n_max_possible = min(n_max, X.shape[0]-1, X.shape[1])
+    pca    = PCA(n_components=n_max_possible)
+    Xfull  = pca.fit_transform(X)
+    cumvar = np.cumsum(pca.explained_variance_ratio_)
+    n_keep = int(np.searchsorted(cumvar, var_threshold) + 1)
+    n_keep = min(n_keep, n_max_possible)
+    return Xfull[:, :n_keep], n_keep
+
+def multiview_pca(X, view_sizes, var_threshold=PCA_VAR_THRESHOLD, n_max_per_view=8):
     """
-    Returns dict with:
-      Xpca_rep, Xtsne, clusters_rep, grades_rep,
-      silhouette_mean, silhouette_std,
-      ac_mean, ac_std,
-      g5_purity_mean, g5_purity_std
+    Fix 2: independent PCA per view, then concatenate.
+    Each view contributes its own reduced representation, preventing large
+    views from dominating the combined space.
+    """
+    parts   = []
+    col_ptr = 0
+    n_used  = []
+    for vs in view_sizes:
+        Xv         = X[:, col_ptr:col_ptr+vs]
+        col_ptr   += vs
+        n_possible = min(n_max_per_view, Xv.shape[0]-1, Xv.shape[1])
+        if n_possible < 1:
+            continue
+        pca        = PCA(n_components=n_possible)
+        Xr         = pca.fit_transform(Xv)
+        cumvar     = np.cumsum(pca.explained_variance_ratio_)
+        n_keep     = int(np.searchsorted(cumvar, var_threshold) + 1)
+        n_keep     = min(n_keep, n_possible)
+        parts.append(Xr[:, :n_keep])
+        n_used.append(n_keep)
+    return np.hstack(parts), sum(n_used)
+
+def run_pipeline(X, grades, label, use_adaptive=True, view_sizes=None):
+    """
+    Clustering pipeline with three PCA modes:
+      use_adaptive=False              → fixed N_PCA_BASELINE=6  (baseline/paper)
+      use_adaptive=True, no views     → Fix 1: adaptive PCA
+      use_adaptive=True, view_sizes   → Fix 2: multi-view PCA (+ Fix 1 per view)
     """
     ts(f"  Pipeline: {label}")
     grades_u  = np.array(sorted(np.unique(grades)))
@@ -280,6 +312,7 @@ def run_pipeline(X, grades, label):
     boot_results = []
     silhouettes  = []
     acs          = []
+    n_pca_log    = []
 
     for b in range(N_BOOTSTRAP):
         idx_boot = []
@@ -292,45 +325,48 @@ def run_pipeline(X, grades, label):
         X_b  = X[idx_boot]
         gr_b = grades[idx_boot]
 
-        pca  = PCA(n_components=min(N_PCA, X_b.shape[1], X_b.shape[0]-1))
-        Xpca = pca.fit_transform(X_b)
+        if not use_adaptive:
+            # Baseline: fixed 6 components
+            n_c  = min(N_PCA_BASELINE, X_b.shape[1], X_b.shape[0]-1)
+            pca  = PCA(n_components=n_c)
+            Xpca = pca.fit_transform(X_b)
+            n_pca_log.append(n_c)
+        elif view_sizes is not None:
+            # Fix 2: multi-view PCA
+            Xpca, n_tot = multiview_pca(X_b, view_sizes)
+            n_pca_log.append(n_tot)
+        else:
+            # Fix 1: adaptive PCA
+            Xpca, n_keep = adaptive_pca(X_b)
+            n_pca_log.append(n_keep)
 
         Z    = linkage(Xpca, method="ward")
         lbls = fcluster(Z, K_CLUSTERS, criterion="maxclust")
 
-        # Silhouette score
-        if len(np.unique(lbls)) > 1:
-            sil = silhouette_score(Xpca, lbls)
-        else:
-            sil = 0.0
-        silhouettes.append(sil)
-
-        # Agglomerative coefficient
+        silhouettes.append(silhouette_score(Xpca, lbls)
+                           if len(np.unique(lbls)) > 1 else 0.0)
         acs.append(agglomerative_coeff(Z, len(Xpca)))
-
         boot_results.append((Xpca, lbls, gr_b, idx_boot))
 
-    # Find representative bootstrap
+    ts(f"    avg PCA dims: {np.mean(n_pca_log):.1f}±{np.std(n_pca_log):.1f}")
+
+    # Representative bootstrap
     all_cfrac = np.stack([cluster_fracs(r[1], r[2]) for r in boot_results])
     meta_cent = all_cfrac.mean(axis=0)
     dists     = [np.linalg.norm(all_cfrac[b] - meta_cent) for b in range(N_BOOTSTRAP)]
     rep_b     = int(np.argmin(dists))
-
     Xpca_rep, lbls_rep, gr_rep, idx_rep = boot_results[rep_b]
 
-    # Order clusters by aggressiveness
+    # Order clusters by aggressiveness score
     cfrac_rep = cluster_fracs(lbls_rep, gr_rep)
     scores    = cfrac_rep @ np.array([3,4,5])
     order     = np.argsort(scores)
     remap     = {old+1: new+1 for new, old in enumerate(order)}
     clusters_ordered = np.array([remap[l] for l in lbls_rep])
 
-    # G5 purity: fraction of G5 in the most G5-dominant cluster
-    g5_purities = []
-    for b in range(N_BOOTSTRAP):
-        _, lbls_b, gr_b, _ = boot_results[b]
-        cf = cluster_fracs(lbls_b, gr_b)
-        g5_purities.append(cf[:, 2].max())   # max G5 fraction across clusters
+    # G5 purity
+    g5_purities = [cluster_fracs(r[1], r[2])[:, 2].max()
+                   for r in boot_results]
 
     # t-SNE
     perp  = min(40, len(Xpca_rep)//4)
@@ -343,23 +379,67 @@ def run_pipeline(X, grades, label):
        f"G5_purity={np.mean(g5_purities):.3f}±{np.std(g5_purities):.3f}")
 
     return {
-        "Xpca_rep"       : Xpca_rep,
-        "Xtsne"          : Xtsne,
-        "clusters_rep"   : clusters_ordered,
-        "grades_rep"     : gr_rep,
-        "cfrac"          : cluster_fracs(clusters_ordered, gr_rep),
-        "silhouette_mean": float(np.mean(silhouettes)),
-        "silhouette_std" : float(np.std(silhouettes)),
-        "ac_mean"        : float(np.mean(acs)),
-        "ac_std"         : float(np.std(acs)),
-        "g5_purity_mean" : float(np.mean(g5_purities)),
-        "g5_purity_std"  : float(np.std(g5_purities)),
+        "Xpca_rep"        : Xpca_rep,
+        "Xtsne"           : Xtsne,
+        "clusters_rep"    : clusters_ordered,
+        "grades_rep"      : gr_rep,
+        "cfrac"           : cluster_fracs(clusters_ordered, gr_rep),
+        "silhouette_mean" : float(np.mean(silhouettes)),
+        "silhouette_std"  : float(np.std(silhouettes)),
+        "ac_mean"         : float(np.mean(acs)),
+        "ac_std"          : float(np.std(acs)),
+        "g5_purity_mean"  : float(np.mean(g5_purities)),
+        "g5_purity_std"   : float(np.std(g5_purities)),
+        "n_pca_mean"      : float(np.mean(n_pca_log)),
     }
 
+
 ts("\nRunning clustering pipeline for all variants …")
+
+# Compute view sizes for multi-view PCA (Fix 2)
+# Each view is one ranked persistence vector (before padding to min_len)
+# We need the per-view lengths from the feature matrices
+def get_view_sizes(X, n_views):
+    """Assume equal-length views (each has X.shape[1] // n_views columns)."""
+    total = X.shape[1]
+    base  = total // n_views
+    sizes = [base] * n_views
+    # distribute remainder to first views
+    for i in range(total % n_views):
+        sizes[i] += 1
+    return sizes
+
+n_views_spatial    = 1 + len(DIRECTIONS)          # 5 views
+n_views_multiscale = len(SCALES)                  # 3 views
+n_views_combined   = len(SCALES) * (1 + len(DIRECTIONS))  # 15 views
+
 results = {}
-for name, X in variants.items():
-    results[name] = run_pipeline(X, grades_all, name)
+results["Baseline\n(paper)"]  = run_pipeline(
+    X_baseline, grades_all, "Baseline (paper)",
+    use_adaptive=False)
+
+results["Spatial\n(PHT)\nFix1+3"] = run_pipeline(
+    X_spatial, grades_all, "Spatial PHT Fix1+3",
+    use_adaptive=True, view_sizes=None)
+
+results["Spatial\n(PHT)\nFix2+3"] = run_pipeline(
+    X_spatial, grades_all, "Spatial PHT Fix2+3",
+    use_adaptive=True,
+    view_sizes=get_view_sizes(X_spatial, n_views_spatial))
+
+results["Multiscale\nFix1+3"] = run_pipeline(
+    X_multiscale, grades_all, "Multiscale Fix1+3",
+    use_adaptive=True, view_sizes=None)
+
+results["Multiscale\nFix2+3"] = run_pipeline(
+    X_multiscale, grades_all, "Multiscale Fix2+3",
+    use_adaptive=True,
+    view_sizes=get_view_sizes(X_multiscale, n_views_multiscale))
+
+results["Combined\nFix2+3"] = run_pipeline(
+    X_combined, grades_all, "Combined Fix2+3",
+    use_adaptive=True,
+    view_sizes=get_view_sizes(X_combined, n_views_combined))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Find representative ROIs per (cluster, grade) using all-ROI PCA
@@ -385,21 +465,34 @@ def get_rep_rois(X, result):
             rois[(c,g)] = all_imgs[best]
     return rois
 
-rep_rois_all = {name: get_rep_rois(X, results[name])
-                for name, X in variants.items()}
+# Map result name → feature matrix
+name_to_X = {
+    "Baseline\n(paper)"    : X_baseline,
+    "Spatial\n(PHT)\nFix1+3" : X_spatial,
+    "Spatial\n(PHT)\nFix2+3" : X_spatial,
+    "Multiscale\nFix1+3"   : X_multiscale,
+    "Multiscale\nFix2+3"   : X_multiscale,
+    "Combined\nFix2+3"     : X_combined,
+}
+rep_rois_all = {name: get_rep_rois(name_to_X[name], results[name])
+                for name in results}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Figure 1: Metrics comparison bar chart
 # ═══════════════════════════════════════════════════════════════════════════════
 ts("Plotting metrics comparison …")
 
-metric_names   = ["Silhouette Score", "Agglomerative\nCoefficient", "G5 Cluster\nPurity"]
-metric_keys_m  = ["silhouette_mean", "ac_mean",  "g5_purity_mean"]
-metric_keys_s  = ["silhouette_std",  "ac_std",   "g5_purity_std"]
-var_names      = list(variants.keys())
-var_colors     = ["#555555", "#e41a1c", "#377eb8", "#4daf4a"]
+metric_names  = ["Silhouette Score", "Agglomerative\nCoefficient", "G5 Cluster\nPurity"]
+metric_keys_m = ["silhouette_mean", "ac_mean",  "g5_purity_mean"]
+metric_keys_s = ["silhouette_std",  "ac_std",   "g5_purity_std"]
+var_names     = list(results.keys())
+# colour: baseline grey, spatial reds, multiscale blues, combined green
+var_colors    = ["#555555",
+                 "#e74c3c", "#c0392b",
+                 "#3498db", "#1a5276",
+                 "#27ae60"]
 
-fig_m, axes_m = plt.subplots(1, 3, figsize=(14, 4))
+fig_m, axes_m = plt.subplots(1, 3, figsize=(16, 5))
 fig_m.patch.set_facecolor("white")
 
 for ai, (mname, mk, sk) in enumerate(zip(metric_names, metric_keys_m, metric_keys_s)):
@@ -412,24 +505,25 @@ for ai, (mname, mk, sk) in enumerate(zip(metric_names, metric_keys_m, metric_key
                   error_kw={"elinewidth":1.2, "ecolor":"#333"})
     ax.set_xticks(x)
     ax.set_xticklabels([n.replace("\n"," ") for n in var_names],
-                       fontsize=8, rotation=15, ha="right")
+                       fontsize=7, rotation=20, ha="right")
     ax.set_title(mname, fontsize=10, fontweight="bold")
     ax.spines[["top","right"]].set_visible(False)
-    ax.set_ylim(0, min(1.15, max(vals)*1.35))
-    # Value labels on bars
+    ax.set_ylim(0, min(1.15, max(vals)*1.4 + 0.05))
     for bar, val in zip(bars, vals):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                f"{val:.3f}", ha="center", va="bottom", fontsize=7)
+        ax.text(bar.get_x() + bar.get_width()/2,
+                bar.get_height() + 0.01,
+                f"{val:.3f}", ha="center", va="bottom", fontsize=6)
 
-fig_m.suptitle("Clustering Quality: Baseline vs Novel Features",
-               fontsize=12, fontweight="bold")
+fig_m.suptitle("Clustering Quality: Baseline vs Novel Feature Variants\n"
+               "(Fix 1=adaptive PCA, Fix 2=multi-view PCA, Fix 3=L2 normalisation)",
+               fontsize=11, fontweight="bold")
 plt.tight_layout()
 fig_m.savefig(os.path.join(OUT_DIR, "metrics_comparison.png"),
               dpi=150, bbox_inches="tight")
 ts("  Saved metrics_comparison.png")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Figure 2: 2×2 t-SNE grid (one panel per variant)
+# Figure 2: 2×3 t-SNE grid
 # ═══════════════════════════════════════════════════════════════════════════════
 ts("Plotting t-SNE comparison …")
 
@@ -437,7 +531,7 @@ CLUSTER_COLORS = ["#e41a1c","#ff7f00","#4daf4a","#377eb8","#984ea3","#a65628"]
 GRADE_MARKERS  = {3:"o", 4:"^", 5:"s"}
 roman          = ["i","ii","iii","iv","v","vi"]
 
-fig_t, axes_t = plt.subplots(2, 2, figsize=(14, 12))
+fig_t, axes_t = plt.subplots(2, 3, figsize=(18, 11))
 fig_t.patch.set_facecolor("white")
 axes_t = axes_t.flatten()
 
@@ -456,10 +550,9 @@ for ai, (name, res) in enumerate(results.items()):
                        c=col, marker=GRADE_MARKERS[g],
                        s=35, alpha=0.85, linewidths=0.3,
                        edgecolors="white", zorder=3)
-
     for c in range(1, K_CLUSTERS+1):
         mask = clust == c
-        if mask.sum() == 0: continue
+        if mask.sum()==0: continue
         mx, my = Xtsne[mask,0].mean(), Xtsne[mask,1].mean()
         ax.text(mx, my, roman[c-1], fontsize=10, fontweight="bold",
                 ha="center", va="center", color=CLUSTER_COLORS[c-1],
@@ -468,12 +561,12 @@ for ai, (name, res) in enumerate(results.items()):
 
     ax.set_xticks([]); ax.set_yticks([])
     ax.spines[["top","right","bottom","left"]].set_visible(False)
-
     sil = res["silhouette_mean"]
     g5p = res["g5_purity_mean"]
+    npca = res["n_pca_mean"]
     ax.set_title(f"{name.replace(chr(10),' ')}   "
-                 f"sil={sil:.3f}  G5-purity={g5p:.3f}",
-                 fontsize=10, fontweight="bold")
+                 f"sil={sil:.3f}  G5={g5p:.3f}  dims={npca:.1f}",
+                 fontsize=9, fontweight="bold")
 
 # Shared legend
 leg_elements = [
@@ -486,9 +579,8 @@ leg_elements = [
     for c in range(1, K_CLUSTERS+1)
 ]
 fig_t.legend(handles=leg_elements, fontsize=8, loc="lower center",
-             ncol=9, bbox_to_anchor=(0.5, -0.02), framealpha=0.8)
-
-fig_t.suptitle("t-SNE: Baseline vs Novel Feature Variants",
+             ncol=9, bbox_to_anchor=(0.5, -0.01), framealpha=0.8)
+fig_t.suptitle("t-SNE: All Variants Compared",
                fontsize=13, fontweight="bold")
 plt.tight_layout(rect=[0, 0.04, 1, 0.97])
 fig_t.savefig(os.path.join(OUT_DIR, "tsne_comparison.png"),
@@ -626,18 +718,19 @@ plt.savefig(os.path.join(OUT_DIR, "figure4_best_variant.png"),
 ts("  Saved figure4_best_variant.png")
 
 # ── Print summary table ───────────────────────────────────────────────────────
-print("\n" + "="*65)
-print(f"{'Variant':<25} {'Silhouette':>12} {'AC':>10} {'G5-Purity':>12}")
-print("="*65)
+print("\n" + "="*75)
+print(f"{'Variant':<28} {'Silhouette':>12} {'AC':>10} {'G5-Purity':>12} {'PCA-dims':>9}")
+print("="*75)
 for name, res in results.items():
-    nm = name.replace("\n"," ")
+    nm     = name.replace("\n"," ")
     marker = " ◄" if name == best_name else ""
-    print(f"{nm:<25} "
+    print(f"{nm:<28} "
           f"{res['silhouette_mean']:>6.3f}±{res['silhouette_std']:.3f}  "
           f"{res['ac_mean']:>5.3f}±{res['ac_std']:.3f}  "
-          f"{res['g5_purity_mean']:>6.3f}±{res['g5_purity_std']:.3f}"
+          f"{res['g5_purity_mean']:>6.3f}±{res['g5_purity_std']:.3f}  "
+          f"{res['n_pca_mean']:>6.1f}"
           f"{marker}")
-print("="*65)
+print("="*75)
 print(f"\nOutputs saved to: {OUT_DIR}")
 print("  metrics_comparison.png")
 print("  tsne_comparison.png")
