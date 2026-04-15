@@ -50,6 +50,11 @@ CACHE_MULTISCALE  = os.path.join(CACHE_DIR, "ph_multiscale.npz")
 CACHE_COMBINED    = os.path.join(CACHE_DIR, "ph_combined.npz")
 CACHE_BASELINE_V2 = os.path.join(CACHE_DIR, "ph_vectors.npz")  # already exists
 
+# Persistence image cache files (new representation)
+CACHE_SPATIAL_PI    = os.path.join(CACHE_DIR, "ph_spatial_pi.npz")
+CACHE_MULTISCALE_PI = os.path.join(CACHE_DIR, "ph_multiscale_pi.npz")
+CACHE_COMBINED_PI   = os.path.join(CACHE_DIR, "ph_combined_pi.npz")
+
 K_CLUSTERS        = 6
 N_BOOTSTRAP       = 50
 N_PCA_BASELINE    = 6        # fixed 6 components for baseline (matches paper)
@@ -93,10 +98,67 @@ def ph_on_grid(grid_f64):
     return get_fin(0), get_fin(1)
 
 def ranked_vec(dgm0, dgm1):
+    """Original ranked persistence vector — kept for baseline only."""
     def sp(d):
         if len(d) == 0: return np.array([])
         return np.sort(d[:,1] - d[:,0])[::-1]
     return np.concatenate([sp(dgm0), sp(dgm1)])
+
+# ── persistence image ─────────────────────────────────────────────────────────
+PI_SIZE    = 10      # n×n grid per diagram → PI_SIZE² features per diagram
+PI_SIGMA   = 0.1     # Gaussian bandwidth (in [0,1] units)
+PI_WEIGHT  = True    # weight each point by persistence (Adams et al. 2017)
+
+def persistence_image(dgm, size=PI_SIZE, sigma=PI_SIGMA,
+                      birth_range=(0,1), pers_range=(0,1)):
+    """
+    Convert a persistence diagram to a fixed-size 2D image (flattened).
+
+    Axes: x = birth, y = persistence (= death - birth), not death.
+    Each point (b, d) maps to (b, d-b) in the image.
+    Weighted by persistence so noise near diagonal contributes little.
+
+    Returns: 1D array of length size*size.
+    """
+    img = np.zeros((size, size), dtype=np.float64)
+    if len(dgm) == 0:
+        return img.ravel()
+
+    births = dgm[:, 0]
+    deaths = dgm[:, 1]
+    pers   = deaths - births          # persistence = vertical distance from diagonal
+
+    # Normalise to [0,1] within specified ranges
+    b_lo, b_hi = birth_range
+    p_lo, p_hi = pers_range
+    b_n = np.clip((births - b_lo) / (b_hi - b_lo + 1e-9), 0, 1)
+    p_n = np.clip((pers   - p_lo) / (p_hi - p_lo + 1e-9), 0, 1)
+
+    # Pixel centres
+    px = (np.arange(size) + 0.5) / size    # birth axis
+    py = (np.arange(size) + 0.5) / size    # persistence axis
+
+    # Accumulate Gaussian kernel for each persistence point
+    for bi, pi, wi in zip(b_n, p_n, (pers if PI_WEIGHT else np.ones_like(pers))):
+        # Gaussian centred at (bi, pi)
+        gb = np.exp(-0.5 * ((px - bi) / sigma) ** 2)   # (size,)
+        gp = np.exp(-0.5 * ((py - pi) / sigma) ** 2)   # (size,)
+        img += wi * np.outer(gp, gb)                    # (size, size)
+
+    # Normalise image to [0,1]
+    mx = img.max()
+    if mx > 0:
+        img /= mx
+    return img.ravel()
+
+def diagram_to_pi(dgm0, dgm1):
+    """
+    Compute persistence images for H0 and H1, concatenate.
+    Fixed output size = 2 * PI_SIZE² regardless of number of persistence points.
+    """
+    pi0 = persistence_image(dgm0)
+    pi1 = persistence_image(dgm1)
+    return np.concatenate([pi0, pi1])
 
 # ── directional filtration ────────────────────────────────────────────────────
 def directional_filtration(hema_norm, angle_deg, size=128):
@@ -109,21 +171,59 @@ def directional_filtration(hema_norm, angle_deg, size=128):
     H, W   = hema_norm.shape
     θ      = np.deg2rad(angle_deg)
     ys, xs = np.mgrid[0:H, 0:W]
-    # projection value for each pixel
-    proj   = xs * np.cos(θ) + ys * np.sin(θ)
-    proj_n = normalise(proj).astype(np.float64)
-    # Weight by hematoxylin so stroma (background) is suppressed:
-    # pixels with low hematoxylin contribute at high filtration value (enter late)
-    # This focuses the topology on nuclear structure in each direction
-    weighted = normalise(proj_n * hema_norm).astype(np.float64)
+    proj     = xs * np.cos(θ) + ys * np.sin(θ)
+    weighted = normalise(proj * hema_norm).astype(np.float64)
     return ph_on_grid(weighted)
 
-# ── feature extraction functions ──────────────────────────────────────────────
-def extract_spatial(hema_128):
+# ── feature extraction using persistence images ───────────────────────────────
+def extract_spatial_pi(hema_128):
     """
     Intensity filtration + 4 directional filtrations at 128×128.
-    Fix 3: each view L2-normalised before concatenation so no view dominates.
+    Each view → persistence image (fixed size).
+    Output: (1 + 4) × 2 × PI_SIZE² = 10 × PI_SIZE² features.
     """
+    parts = []
+    dgm0, dgm1 = ph_on_grid(hema_128)
+    parts.append(diagram_to_pi(dgm0, dgm1))
+    for angle in DIRECTIONS:
+        dgm0, dgm1 = directional_filtration(hema_128, angle)
+        parts.append(diagram_to_pi(dgm0, dgm1))
+    return np.concatenate(parts)
+
+def extract_multiscale_pi(hema_128):
+    """
+    Intensity filtration at 3 scales.
+    Each scale → persistence image (fixed size).
+    Output: 3 × 2 × PI_SIZE² features.
+    """
+    parts = []
+    for size in SCALES:
+        grid = hema_128 if size == 128 else normalise(
+            sk_resize(hema_128, (size, size), anti_aliasing=True)
+        ).astype(np.float64)
+        dgm0, dgm1 = ph_on_grid(grid)
+        parts.append(diagram_to_pi(dgm0, dgm1))
+    return np.concatenate(parts)
+
+def extract_combined_pi(hema_128):
+    """
+    All directions × all scales → persistence images.
+    Output: 3 × 5 × 2 × PI_SIZE² features = 15 × 2 × PI_SIZE² features.
+    """
+    parts = []
+    for size in SCALES:
+        grid = hema_128 if size == 128 else normalise(
+            sk_resize(hema_128, (size, size), anti_aliasing=True)
+        ).astype(np.float64)
+        dgm0, dgm1 = ph_on_grid(grid)
+        parts.append(diagram_to_pi(dgm0, dgm1))
+        for angle in DIRECTIONS:
+            dgm0, dgm1 = directional_filtration(grid, angle)
+            parts.append(diagram_to_pi(dgm0, dgm1))
+    return np.concatenate(parts)
+
+# ── legacy ranked-vector extractions (kept for cache compatibility) ────────────
+def extract_spatial(hema_128):
     parts = []
     dgm0, dgm1 = ph_on_grid(hema_128)
     parts.append(l2_normalise(ranked_vec(dgm0, dgm1)))
@@ -133,10 +233,6 @@ def extract_spatial(hema_128):
     return np.concatenate(parts)
 
 def extract_multiscale(hema_128):
-    """
-    Intensity filtration at 3 scales (32, 64, 128).
-    Fix 3: each scale L2-normalised before concatenation.
-    """
     parts = []
     for size in SCALES:
         grid = hema_128 if size == 128 else sk_resize(hema_128, (size, size), anti_aliasing=True)
@@ -146,10 +242,6 @@ def extract_multiscale(hema_128):
     return np.concatenate(parts)
 
 def extract_combined(hema_128):
-    """
-    All directions × all scales.
-    Fix 3: each (scale, direction) view L2-normalised before concatenation.
-    """
     parts = []
     for size in SCALES:
         grid = hema_128 if size == 128 else normalise(
@@ -224,9 +316,14 @@ else:
     np.savez_compressed(CACHE_BASELINE_V2, X_raw=X_baseline)
     ts(f"  X_baseline {X_baseline.shape}")
 
-X_spatial    = build_feature_matrix(extract_spatial,    CACHE_SPATIAL,    "spatial (PHT)")
-X_multiscale = build_feature_matrix(extract_multiscale, CACHE_MULTISCALE, "multiscale")
-X_combined   = build_feature_matrix(extract_combined,   CACHE_COMBINED,   "combined")
+X_spatial    = build_feature_matrix(extract_spatial,    CACHE_SPATIAL,    "spatial (PHT) ranked")
+X_multiscale = build_feature_matrix(extract_multiscale, CACHE_MULTISCALE, "multiscale ranked")
+X_combined   = build_feature_matrix(extract_combined,   CACHE_COMBINED,   "combined ranked")
+
+# Persistence image variants (fixed-size, dimensionality-controlled)
+X_spatial_pi    = build_feature_matrix(extract_spatial_pi,    CACHE_SPATIAL_PI,    "spatial (PHT) PI")
+X_multiscale_pi = build_feature_matrix(extract_multiscale_pi, CACHE_MULTISCALE_PI, "multiscale PI")
+X_combined_pi   = build_feature_matrix(extract_combined_pi,   CACHE_COMBINED_PI,   "combined PI")
 
 variants = {
     "Baseline\n(paper)"  : X_baseline,
@@ -238,6 +335,9 @@ variants = {
 ts(f"\nFeature matrix sizes:")
 for name, X in variants.items():
     ts(f"  {name.replace(chr(10),' '):<25} {X.shape}")
+ts(f"  {'Spatial PI':<25} {X_spatial_pi.shape}")
+ts(f"  {'Multiscale PI':<25} {X_multiscale_pi.shape}")
+ts(f"  {'Combined PI':<25} {X_combined_pi.shape}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Clustering pipeline (same for all variants)
@@ -442,6 +542,39 @@ results["Combined\nFix2+3"] = run_pipeline(
     use_adaptive=True,
     view_sizes=get_view_sizes(X_combined, n_views_combined))
 
+# ── Persistence Image variants ────────────────────────────────────────────────
+# PI produces fixed-size features: each view = 2*PI_SIZE² values
+# So total dims are small and controlled regardless of diagram complexity
+pi_view_size     = 2 * PI_SIZE * PI_SIZE          # features per view
+
+n_views_sp_pi   = 1 + len(DIRECTIONS)             # 5
+n_views_ms_pi   = len(SCALES)                     # 3
+n_views_comb_pi = len(SCALES) * (1+len(DIRECTIONS))  # 15
+
+ts("  — Persistence Image variants —")
+results["Spatial PI\nFix1"] = run_pipeline(
+    X_spatial_pi, grades_all, "Spatial PI Fix1",
+    use_adaptive=True, view_sizes=None)
+
+results["Spatial PI\nFix2"] = run_pipeline(
+    X_spatial_pi, grades_all, "Spatial PI Fix2",
+    use_adaptive=True,
+    view_sizes=[pi_view_size] * n_views_sp_pi)
+
+results["Multiscale PI\nFix1"] = run_pipeline(
+    X_multiscale_pi, grades_all, "Multiscale PI Fix1",
+    use_adaptive=True, view_sizes=None)
+
+results["Multiscale PI\nFix2"] = run_pipeline(
+    X_multiscale_pi, grades_all, "Multiscale PI Fix2",
+    use_adaptive=True,
+    view_sizes=[pi_view_size] * n_views_ms_pi)
+
+results["Combined PI\nFix2"] = run_pipeline(
+    X_combined_pi, grades_all, "Combined PI Fix2",
+    use_adaptive=True,
+    view_sizes=[pi_view_size] * n_views_comb_pi)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Find representative ROIs per (cluster, grade) using all-ROI PCA
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -472,12 +605,17 @@ def get_rep_rois(X, result):
 
 # Map result name → feature matrix
 name_to_X = {
-    "Baseline\n(paper)"    : X_baseline,
+    "Baseline\n(paper)"      : X_baseline,
     "Spatial\n(PHT)\nFix1+3" : X_spatial,
     "Spatial\n(PHT)\nFix2+3" : X_spatial,
-    "Multiscale\nFix1+3"   : X_multiscale,
-    "Multiscale\nFix2+3"   : X_multiscale,
-    "Combined\nFix2+3"     : X_combined,
+    "Multiscale\nFix1+3"     : X_multiscale,
+    "Multiscale\nFix2+3"     : X_multiscale,
+    "Combined\nFix2+3"       : X_combined,
+    "Spatial PI\nFix1"       : X_spatial_pi,
+    "Spatial PI\nFix2"       : X_spatial_pi,
+    "Multiscale PI\nFix1"    : X_multiscale_pi,
+    "Multiscale PI\nFix2"    : X_multiscale_pi,
+    "Combined PI\nFix2"      : X_combined_pi,
 }
 rep_rois_all = {name: get_rep_rois(name_to_X[name], results[name])
                 for name in results}
@@ -491,13 +629,19 @@ metric_names  = ["Silhouette Score", "Agglomerative\nCoefficient", "G5 Cluster\n
 metric_keys_m = ["silhouette_mean", "ac_mean",  "g5_purity_mean"]
 metric_keys_s = ["silhouette_std",  "ac_std",   "g5_purity_std"]
 var_names     = list(results.keys())
-# colour: baseline grey, spatial reds, multiscale blues, combined green
-var_colors    = ["#555555",
-                 "#e74c3c", "#c0392b",
-                 "#3498db", "#1a5276",
-                 "#27ae60"]
 
-fig_m, axes_m = plt.subplots(1, 3, figsize=(16, 5))
+# Colour scheme: baseline grey, ranked spatial/MS/combined warm, PI variants cool
+var_colors = (
+    ["#555555"]                        # baseline
+    + ["#e74c3c","#c0392b"]            # spatial ranked
+    + ["#3498db","#1a5276"]            # multiscale ranked
+    + ["#27ae60"]                      # combined ranked
+    + ["#f39c12","#e67e22"]            # spatial PI
+    + ["#9b59b6","#6c3483"]            # multiscale PI
+    + ["#1abc9c"]                      # combined PI
+)
+
+fig_m, axes_m = plt.subplots(1, 3, figsize=(18, 5))
 fig_m.patch.set_facecolor("white")
 
 for ai, (mname, mk, sk) in enumerate(zip(metric_names, metric_keys_m, metric_keys_s)):
@@ -505,30 +649,33 @@ for ai, (mname, mk, sk) in enumerate(zip(metric_names, metric_keys_m, metric_key
     vals = [results[n][mk] for n in var_names]
     errs = [results[n][sk] for n in var_names]
     x    = np.arange(len(var_names))
-    bars = ax.bar(x, vals, 0.6, color=var_colors,
-                  yerr=errs, capsize=4,
-                  error_kw={"elinewidth":1.2, "ecolor":"#333"})
+    bars = ax.bar(x, vals, 0.65, color=var_colors[:len(var_names)],
+                  yerr=errs, capsize=3,
+                  error_kw={"elinewidth":1.0, "ecolor":"#333"})
     ax.set_xticks(x)
     ax.set_xticklabels([n.replace("\n"," ") for n in var_names],
-                       fontsize=7, rotation=20, ha="right")
+                       fontsize=6, rotation=30, ha="right")
     ax.set_title(mname, fontsize=10, fontweight="bold")
     ax.spines[["top","right"]].set_visible(False)
-    ax.set_ylim(0, min(1.15, max(vals)*1.4 + 0.05))
+    ax.set_ylim(0, min(1.15, max(vals)*1.45 + 0.05))
     for bar, val in zip(bars, vals):
         ax.text(bar.get_x() + bar.get_width()/2,
                 bar.get_height() + 0.01,
-                f"{val:.3f}", ha="center", va="bottom", fontsize=6)
+                f"{val:.3f}", ha="center", va="bottom", fontsize=5.5,
+                rotation=45)
 
-fig_m.suptitle("Clustering Quality: Baseline vs Novel Feature Variants\n"
-               "(Fix 1=adaptive PCA, Fix 2=multi-view PCA, Fix 3=L2 normalisation)",
-               fontsize=11, fontweight="bold")
+fig_m.suptitle(
+    "Clustering Quality: Baseline vs Novel Features\n"
+    f"Ranked vector (grey/warm) vs Persistence Image PI_{PI_SIZE}×{PI_SIZE} (cool)\n"
+    "Fix1=adaptive PCA  Fix2=multi-view PCA  Fix3=L2 norm",
+    fontsize=10, fontweight="bold")
 plt.tight_layout()
 fig_m.savefig(os.path.join(OUT_DIR, "metrics_comparison.png"),
               dpi=150, bbox_inches="tight")
 ts("  Saved metrics_comparison.png")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Figure 2: 2×3 t-SNE grid
+# Figure 2: t-SNE grid — 4×3 layout for 11 variants (last cell empty)
 # ═══════════════════════════════════════════════════════════════════════════════
 ts("Plotting t-SNE comparison …")
 
@@ -536,7 +683,11 @@ CLUSTER_COLORS = ["#e41a1c","#ff7f00","#4daf4a","#377eb8","#984ea3","#a65628"]
 GRADE_MARKERS  = {3:"o", 4:"^", 5:"s"}
 roman          = ["i","ii","iii","iv","v","vi"]
 
-fig_t, axes_t = plt.subplots(2, 3, figsize=(18, 11))
+n_variants = len(results)
+n_cols     = 4
+n_rows     = int(np.ceil(n_variants / n_cols))
+
+fig_t, axes_t = plt.subplots(n_rows, n_cols, figsize=(20, n_rows*5))
 fig_t.patch.set_facecolor("white")
 axes_t = axes_t.flatten()
 
@@ -559,34 +710,35 @@ for ai, (name, res) in enumerate(results.items()):
         mask = clust == c
         if mask.sum()==0: continue
         mx, my = Xtsne[mask,0].mean(), Xtsne[mask,1].mean()
-        ax.text(mx, my, roman[c-1], fontsize=10, fontweight="bold",
+        ax.text(mx, my, roman[c-1], fontsize=9, fontweight="bold",
                 ha="center", va="center", color=CLUSTER_COLORS[c-1],
-                bbox=dict(boxstyle="round,pad=0.15", fc="white",
+                bbox=dict(boxstyle="round,pad=0.12", fc="white",
                           ec="none", alpha=0.7), zorder=5)
-
     ax.set_xticks([]); ax.set_yticks([])
     ax.spines[["top","right","bottom","left"]].set_visible(False)
-    sil = res["silhouette_mean"]
-    g5p = res["g5_purity_mean"]
+    sil  = res["silhouette_mean"]
+    g5p  = res["g5_purity_mean"]
     npca = res["n_pca_mean"]
-    ax.set_title(f"{name.replace(chr(10),' ')}   "
-                 f"sil={sil:.3f}  G5={g5p:.3f}  dims={npca:.1f}",
-                 fontsize=9, fontweight="bold")
+    ax.set_title(f"{name.replace(chr(10),' ')}\n"
+                 f"sil={sil:.3f}  G5={g5p:.3f}  dims={npca:.0f}",
+                 fontsize=8, fontweight="bold")
 
-# Shared legend
+# Hide any unused axes
+for ai in range(n_variants, len(axes_t)):
+    axes_t[ai].set_visible(False)
+
 leg_elements = [
-    plt.Line2D([0],[0],marker="o",color="grey",ls="",ms=8,label="G3"),
-    plt.Line2D([0],[0],marker="^",color="grey",ls="",ms=8,label="G4"),
-    plt.Line2D([0],[0],marker="s",color="grey",ls="",ms=8,label="G5"),
+    plt.Line2D([0],[0],marker="o",color="grey",ls="",ms=7,label="G3"),
+    plt.Line2D([0],[0],marker="^",color="grey",ls="",ms=7,label="G4"),
+    plt.Line2D([0],[0],marker="s",color="grey",ls="",ms=7,label="G5"),
 ] + [
-    plt.Line2D([0],[0],marker="o",color=CLUSTER_COLORS[c-1],ls="",ms=8,
+    plt.Line2D([0],[0],marker="o",color=CLUSTER_COLORS[c-1],ls="",ms=7,
                label=f"cluster {roman[c-1]}")
     for c in range(1, K_CLUSTERS+1)
 ]
 fig_t.legend(handles=leg_elements, fontsize=8, loc="lower center",
              ncol=9, bbox_to_anchor=(0.5, -0.01), framealpha=0.8)
-fig_t.suptitle("t-SNE: All Variants Compared",
-               fontsize=13, fontweight="bold")
+fig_t.suptitle("t-SNE: All Variants", fontsize=13, fontweight="bold")
 plt.tight_layout(rect=[0, 0.04, 1, 0.97])
 fig_t.savefig(os.path.join(OUT_DIR, "tsne_comparison.png"),
               dpi=150, bbox_inches="tight")
@@ -723,19 +875,19 @@ plt.savefig(os.path.join(OUT_DIR, "figure4_best_variant.png"),
 ts("  Saved figure4_best_variant.png")
 
 # ── Print summary table ───────────────────────────────────────────────────────
-print("\n" + "="*75)
-print(f"{'Variant':<28} {'Silhouette':>12} {'AC':>10} {'G5-Purity':>12} {'PCA-dims':>9}")
-print("="*75)
+print("\n" + "="*82)
+print(f"{'Variant':<32} {'Silhouette':>12} {'AC':>10} {'G5-Purity':>12} {'PCA-dims':>9}")
+print("="*82)
 for name, res in results.items():
     nm     = name.replace("\n"," ")
     marker = " ◄" if name == best_name else ""
-    print(f"{nm:<28} "
+    print(f"{nm:<32} "
           f"{res['silhouette_mean']:>6.3f}±{res['silhouette_std']:.3f}  "
           f"{res['ac_mean']:>5.3f}±{res['ac_std']:.3f}  "
           f"{res['g5_purity_mean']:>6.3f}±{res['g5_purity_std']:.3f}  "
           f"{res['n_pca_mean']:>6.1f}"
           f"{marker}")
-print("="*75)
+print("="*82)
 print(f"\nOutputs saved to: {OUT_DIR}")
 print("  metrics_comparison.png")
 print("  tsne_comparison.png")
