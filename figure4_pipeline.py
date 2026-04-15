@@ -292,7 +292,7 @@ Xpca_rep, lbls_rep, gr_rep, idx_rep = boot_results[rep_b]
 # ── 5. t-SNE on representative bootstrap ─────────────────────────────────────
 print("\nSTEP 5: t-SNE")
 perp = min(47, len(Xpca_rep)//3)
-tsne = TSNE(n_components=2, perplexity=perp, random_state=42, n_iter=1000)
+tsne = TSNE(n_components=2, perplexity=perp, random_state=42, max_iter=1000)
 Xtsne = tsne.fit_transform(Xpca_rep)
 
 # ── 6. Order clusters by Gleason grade composition ───────────────────────────
