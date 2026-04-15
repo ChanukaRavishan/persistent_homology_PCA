@@ -298,7 +298,7 @@ else:
     ts("  Running t-SNE …")
     perp  = min(40, len(Xpca_rep)//4)
     tsne  = TSNE(n_components=2, perplexity=perp, random_state=7,
-                 max_iter=2000, learning_rate="auto", init="pca")
+                 n_iter=2000, learning_rate="auto", init="pca")
     Xtsne = tsne.fit_transform(Xpca_rep)
 
     np.savez(CACHE_PIPELINE,
@@ -380,11 +380,24 @@ for c in range(1, K_CLUSTERS+1):
                 zorder=5)
 ax_tsne.set_xticks([]); ax_tsne.set_yticks([])
 ax_tsne.spines[["top","right","bottom","left"]].set_visible(False)
-ax_tsne.legend(handles=[
+
+grade_legend = [
     plt.Line2D([0],[0],marker="o",color="grey",ls="",ms=7,label="G3"),
     plt.Line2D([0],[0],marker="^",color="grey",ls="",ms=7,label="G4"),
     plt.Line2D([0],[0],marker="s",color="grey",ls="",ms=7,label="G5"),
-], fontsize=8, loc="lower left", framealpha=0.8, edgecolor="grey")
+]
+cluster_legend = [
+    plt.Line2D([0],[0],marker="o",color=CLUSTER_COLORS[c-1],ls="",ms=7,
+               label=roman[c-1])
+    for c in range(1, K_CLUSTERS+1)
+]
+leg1 = ax_tsne.legend(handles=grade_legend, fontsize=7, loc="lower left",
+                      framealpha=0.8, edgecolor="grey",
+                      title="Grade", title_fontsize=7)
+ax_tsne.add_artist(leg1)
+ax_tsne.legend(handles=cluster_legend, fontsize=7, loc="upper right",
+               framealpha=0.8, edgecolor="grey",
+               title="Cluster", title_fontsize=7, ncol=2)
 ax_tsne.set_title("t-SNE", fontsize=10, fontweight="bold", pad=3)
 
 # Column headers
@@ -429,11 +442,15 @@ for ci, c in enumerate(range(1, K_CLUSTERS+1)):
            error_kw={"elinewidth":0.8, "ecolor":"#333"})
     ax.set_xticks(x)
     ax.set_xticklabels(["G3","G4","G5"], fontsize=6)
-    ax.set_ylim(0, 1.05)
+    ax.set_ylim(0, 1.15)
     ax.tick_params(axis="y", labelsize=6)
     ax.spines[["top","right"]].set_visible(False)
     if ci == 0: ax.set_ylabel("Fraction", fontsize=7)
     else:       ax.set_yticklabels([])
+    # N count
+    n_c = (clusters_rep == c).sum()
+    ax.text(0.5, 1.05, f"n={n_c}", transform=ax.transAxes,
+            fontsize=6, ha="center", va="bottom", color="#444")
 
 fig.suptitle(
     f"PH reveals architectural subpatterns — Subset1\n"
