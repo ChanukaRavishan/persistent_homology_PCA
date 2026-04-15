@@ -38,10 +38,10 @@ from scipy.spatial.distance import pdist, squareform
 warnings.filterwarnings("ignore")
 
 # ── config ────────────────────────────────────────────────────────────────────
-BASE_TIFF   = "/Users/chanuka/Desktop/codespaces/ph_cancer/magicScan_TDA_ML/Subset1/Subset1_Test_{}.tiff"
-BASE_GEOJSON= "/Users/chanuka/Desktop/codespaces/ph_cancer/magicScan_TDA_ML/Subset1_annot/Subset1_Test_{}.geojson"
-OUT_PATH    = "/Users/chanuka/Desktop/codespaces/ph_cancer/figure4_replicate.png"
-OUT_DATA    = "/Users/chanuka/Desktop/codespaces/ph_cancer/figure4_data.npz"
+BASE_TIFF   = "magicScan_TDA_ML/Subset1/Subset1_Test_{}.tiff"
+BASE_GEOJSON= "magicScan_TDA_ML/Subset1_annot/Subset1_Test_{}.geojson"
+OUT_PATH    = "figure4_replicate.png"
+OUT_DATA    = "figure4_data.npz"
 
 ROI_SIZE    = 512       # pixels
 PH_SIZE     = 64        # downsample for PH (faster; 64×64 sufficient for topology)
