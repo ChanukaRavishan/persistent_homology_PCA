@@ -298,7 +298,7 @@ else:
     ts("  Running t-SNE …")
     perp  = min(40, len(Xpca_rep)//4)
     tsne  = TSNE(n_components=2, perplexity=perp, random_state=7,
-                 n_iter=2000, learning_rate="auto", init="pca")
+                 max_iter=2000, learning_rate="auto", init="pca")
     Xtsne = tsne.fit_transform(Xpca_rep)
 
     np.savez(CACHE_PIPELINE,
