@@ -353,14 +353,14 @@ roman          = ["i","ii","iii","iv","v","vi"]
 
 fig = plt.figure(figsize=(22, 11))
 fig.patch.set_facecolor("white")
-gs  = GridSpec(5, 7, figure=fig,
+gs  = GridSpec(5, 8, figure=fig,
                height_ratios=[0.15, 1, 1, 1, 0.8],
-               width_ratios=[1.8, 0.15, 1,1,1,1,1],
+               width_ratios=[1.8, 0.15, 1,1,1,1,1,1],
                wspace=0.08, hspace=0.12,
                left=0.03, right=0.98, top=0.92, bottom=0.04)
 
 # t-SNE
-ax_tsne = fig.add_subplot(gs[0:4, 0])
+ax_tsne = fig.add_subplot(gs[0:5, 0])
 for c in range(1, K_CLUSTERS+1):
     col = CLUSTER_COLORS[c-1]
     for g in [3,4,5]:
