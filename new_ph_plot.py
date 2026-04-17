@@ -1,35 +1,3 @@
-"""
-unsupervised_compact.py
-───────────────────────
-Unsupervised version of the compact feature pipeline.
-
-Key difference from replacement_compact_features.py:
-  - NO f_classif / feature selection inside the bootstrap loop
-  - Features are standardised then PCA-reduced, no label information used
-  - This is a fair comparison to the original paper's unsupervised pipeline
-
-Feature sets (same as before, just no supervised filtering):
-  BaselineTopLife       — top-k PH lifetimes only
-  Base+Life             — + lifetime summary statistics
-  Base+Betti            — + Betti curve summaries
-  Base+Life+Betti       — best from supervised experiment
-  Base+Life+Betti+Morph — full compact set
-
-Inputs:
-  cache/roi_images.npz
-  cache/roi_meta.npz
-  cache/compact_feature_sets.npz   (built by replacement_compact_features.py)
-
-Outputs:
-  unsupervised_metrics.csv
-  unsupervised_metrics.png
-  figure4_unsupervised_best.png
-
-Run:
-  python unsupervised_compact.py [--force-pipeline]
-  --force-pipeline  rerun bootstrap even if csv exists
-"""
-
 import os, sys, time, warnings
 import numpy as np
 import pandas as pd
@@ -44,7 +12,6 @@ from sklearn.preprocessing import StandardScaler
 from scipy.cluster.hierarchy import linkage, fcluster
 warnings.filterwarnings("ignore")
 
-# ── config ────────────────────────────────────────────────────────────────────
 CACHE_DIR      = "cache"
 CACHE_IMAGES   = os.path.join(CACHE_DIR, "roi_images.npz")
 CACHE_META     = os.path.join(CACHE_DIR, "roi_meta.npz")
@@ -57,7 +24,6 @@ K_CLUSTERS   = 6
 N_BOOTSTRAP  = 50
 RANDOM_SEED  = 7
 
-# PCA options to sweep — same as supervised script for fair comparison
 PCA_OPTIONS = [6, 8, 10, 15]
 
 FORCE_PIPELINE = "--force-pipeline" in sys.argv[1:]
@@ -65,7 +31,6 @@ FORCE_PIPELINE = "--force-pipeline" in sys.argv[1:]
 def ts(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ── helpers ───────────────────────────────────────────────────────────────────
 def cluster_fracs(lbls, grades, k=K_CLUSTERS):
     out = np.zeros((k, 3))
     for ci, c in enumerate(range(1, k+1)):
@@ -106,7 +71,6 @@ def adaptive_pca(X, n_components):
     var_explained = pca.explained_variance_ratio_.cumsum()[-1]
     return Xe, scaler, pca, float(var_explained)
 
-# ── load data ─────────────────────────────────────────────────────────────────
 ts("Loading cached data …")
 all_imgs   = np.load(CACHE_IMAGES)["thumbnails"].astype(np.float32)
 grades_all = np.load(CACHE_META, allow_pickle=True)["grades"].astype(np.int32)
@@ -134,12 +98,7 @@ ts("Feature matrix shapes:")
 for name, X in feature_sets.items():
     ts(f"  {name:<28} {X.shape}")
 
-# ── pipeline ──────────────────────────────────────────────────────────────────
 def run_unsupervised(X, grades, label, pca_dim):
-    """
-    Fully unsupervised pipeline:
-      standardise → PCA (no labels) → Ward clustering → metrics
-    """
     grades_u  = np.array(sorted(np.unique(grades)))
     min_count = min((grades==g).sum() for g in grades_u)
 
